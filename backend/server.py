@@ -9,12 +9,33 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 
 from ai_agents.agents import AgentConfig, ChatAgent, SearchAgent
+from auth import (
+    create_access_token,
+    hash_password,
+    require_role,
+    security,
+    verify_password,
+)
+from models import (
+    InventoryItem,
+    InventoryItemCreate,
+    InventoryItemUpdate,
+    MetalPrice,
+    MetalPriceUpdate,
+    Token,
+    User,
+    UserCreate,
+    UserLogin,
+    UserResponse,
+    UserRole,
+)
 
 
 logging.basicConfig(
@@ -234,6 +255,206 @@ async def get_agent_capabilities(request: Request):
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("Error getting capabilities")
         return {"success": False, "error": str(exc)}
+
+
+# Authentication endpoints
+@api_router.post("/auth/register", response_model=Token)
+async def register(user_create: UserCreate, request: Request):
+    db = _ensure_db(request)
+
+    # Check if username exists
+    existing_user = await db.users.find_one({"username": user_create.username})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    # Check if email exists
+    existing_email = await db.users.find_one({"email": user_create.email})
+    if existing_email:
+        raise HTTPException(status_code=400, detail="Email already exists")
+
+    # Create user
+    user = User(
+        username=user_create.username,
+        email=user_create.email,
+        hashed_password=hash_password(user_create.password),
+        role=user_create.role,
+    )
+
+    await db.users.insert_one(user.model_dump())
+
+    # Create token
+    access_token = create_access_token(data={"sub": user.username, "role": user.role.value})
+
+    return Token(
+        access_token=access_token,
+        user=UserResponse(**user.model_dump()),
+    )
+
+
+@api_router.post("/auth/login", response_model=Token)
+async def login(user_login: UserLogin, request: Request):
+    db = _ensure_db(request)
+
+    # Find user
+    user_data = await db.users.find_one({"username": user_login.username})
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    user = User(**user_data)
+
+    # Verify password
+    if not verify_password(user_login.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    # Create token
+    access_token = create_access_token(data={"sub": user.username, "role": user.role.value})
+
+    return Token(
+        access_token=access_token,
+        user=UserResponse(**user.model_dump()),
+    )
+
+
+@api_router.get("/auth/me", response_model=UserResponse)
+async def get_current_user_info(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    from auth import get_current_user
+    user = await get_current_user(request, credentials)
+    return UserResponse(**user.model_dump())
+
+
+# Metal price endpoints
+@api_router.get("/metal-prices", response_model=MetalPrice)
+async def get_metal_prices(request: Request):
+    db = _ensure_db(request)
+
+    # Get latest price
+    price_data = await db.metal_prices.find_one(sort=[("updated_at", -1)])
+
+    if not price_data:
+        # Return default prices if none exist
+        return MetalPrice(
+            gold_price=0.0,
+            silver_price=0.0,
+            platinum_price=0.0,
+            updated_by="system",
+        )
+
+    return MetalPrice(**price_data)
+
+
+@api_router.put("/metal-prices", response_model=MetalPrice)
+async def update_metal_prices(
+    price_update: MetalPriceUpdate,
+    request: Request,
+    user: User = Depends(require_role(UserRole.ADMIN)),
+):
+    db = _ensure_db(request)
+
+    # Create new price record
+    metal_price = MetalPrice(
+        gold_price=price_update.gold_price,
+        silver_price=price_update.silver_price,
+        platinum_price=price_update.platinum_price or 0.0,
+        updated_by=user.username,
+    )
+
+    await db.metal_prices.insert_one(metal_price.model_dump())
+
+    return metal_price
+
+
+# Inventory endpoints
+@api_router.get("/inventory", response_model=List[InventoryItem])
+async def get_inventory(
+    request: Request,
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.MANAGER, UserRole.SALESPERSON)),
+):
+    db = _ensure_db(request)
+
+    items = await db.inventory_items.find().sort("created_at", -1).to_list(1000)
+    return [InventoryItem(**item) for item in items]
+
+
+@api_router.post("/inventory", response_model=InventoryItem)
+async def create_inventory_item(
+    item_create: InventoryItemCreate,
+    request: Request,
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.MANAGER)),
+):
+    db = _ensure_db(request)
+
+    # Check if SKU exists
+    existing_item = await db.inventory_items.find_one({"sku": item_create.sku})
+    if existing_item:
+        raise HTTPException(status_code=400, detail="SKU already exists")
+
+    # Create item
+    item = InventoryItem(
+        **item_create.model_dump(),
+        created_by=user.username,
+    )
+
+    await db.inventory_items.insert_one(item.model_dump())
+
+    return item
+
+
+@api_router.get("/inventory/{item_id}", response_model=InventoryItem)
+async def get_inventory_item(
+    item_id: str,
+    request: Request,
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.MANAGER, UserRole.SALESPERSON)),
+):
+    db = _ensure_db(request)
+
+    item_data = await db.inventory_items.find_one({"id": item_id})
+    if not item_data:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    return InventoryItem(**item_data)
+
+
+@api_router.put("/inventory/{item_id}", response_model=InventoryItem)
+async def update_inventory_item(
+    item_id: str,
+    item_update: InventoryItemUpdate,
+    request: Request,
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.MANAGER)),
+):
+    db = _ensure_db(request)
+
+    item_data = await db.inventory_items.find_one({"id": item_id})
+    if not item_data:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # Update fields
+    update_data = {k: v for k, v in item_update.model_dump().items() if v is not None}
+    update_data["updated_at"] = datetime.now(timezone.utc)
+
+    await db.inventory_items.update_one({"id": item_id}, {"$set": update_data})
+
+    # Get updated item
+    updated_item = await db.inventory_items.find_one({"id": item_id})
+    return InventoryItem(**updated_item)
+
+
+@api_router.delete("/inventory/{item_id}")
+async def delete_inventory_item(
+    item_id: str,
+    request: Request,
+    user: User = Depends(require_role(UserRole.ADMIN, UserRole.MANAGER)),
+):
+    db = _ensure_db(request)
+
+    result = await db.inventory_items.delete_one({"id": item_id})
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    return {"success": True, "message": "Item deleted successfully"}
 
 
 app.include_router(api_router)
